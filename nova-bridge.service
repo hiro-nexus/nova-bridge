@@ -1,0 +1,19 @@
+[Unit]
+Description=Nova Slack Bridge (Socket Mode)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hiro
+WorkingDirectory=/home/hiro/nova-bridge
+EnvironmentFile=/home/hiro/nova-bridge/.env
+Environment=PATH=/home/hiro/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+UnsetEnvironment=ANTHROPIC_API_KEY
+ExecStart=/home/hiro/nova-bridge/.venv/bin/python bridge.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
