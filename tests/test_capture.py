@@ -13,8 +13,10 @@ HERE = Path(__file__).resolve().parent
 
 
 def load(name: str):
-    """本番（tests/ の1つ上）か、Vault 内の下書き（接頭辞つき）から読み込む。"""
-    for p in (HERE.parent / f"{name}.py", HERE / f"nova-bridge_phase2B_{name}.py"):
+    """本番（tests/ の1つ上）か、Vault 内の下書き（接頭辞つき。新しい版を優先）から読み込む。"""
+    candidates = [HERE.parent / f"{name}.py"]
+    candidates += sorted(HERE.glob(f"nova-bridge_phase2*_{name}.py"), reverse=True)
+    for p in candidates:
         if p.exists():
             spec = importlib.util.spec_from_file_location(name, p)
             mod = importlib.util.module_from_spec(spec)
@@ -64,7 +66,16 @@ def test_context(tmp: Path):
     assert "origin_id: slack:C1:2026-10-08" in body
     assert body.count("updated: 2026-10-08") == 1
     assert body.index("## 01:06:53") < body.index("最初の発言") < body.index("## 01:07:53") < body.index("次の発言")
+    assert "(音声)" not in body
     assert not list(p1.parent.glob("*.tmp"))
+
+
+def test_context_via(tmp: Path):
+    p = capture.save_context(tmp, "C1", TS_A, "音声のメモ", via="音声")
+    capture.save_context(tmp, "C1", TS_B, "キーボードのメモ")
+    body = p.read_text(encoding="utf-8")
+    assert "## 01:06:53 (音声)\n" in body, body
+    assert "## 01:07:53\n" in body and "## 01:07:53 (" not in body
 
 
 def test_inbox(tmp: Path):
@@ -77,7 +88,15 @@ def test_inbox(tmp: Path):
     body = a.read_text(encoding="utf-8")
     assert 'title: "テスト 最初の一行"' in body
     assert "type: fleeting" in body and "tags: [inbox]" in body and "status: active" in body
+    assert "via:" not in body
     assert body.rstrip().endswith("本文")
+
+
+def test_inbox_via(tmp: Path):
+    a = capture.save_inbox(tmp, "C2", TS_A, "音声のメモ", via="音声")
+    b = capture.save_inbox(tmp, "C2", TS_B, "キーボードのメモ")
+    assert "source: slack\nvia: 音声\norigin_id:" in a.read_text(encoding="utf-8")
+    assert "via:" not in b.read_text(encoding="utf-8")
 
 
 def make_repos(tmp: Path):
@@ -137,7 +156,7 @@ def test_gitsync(tmp: Path):
 if __name__ == "__main__":
     test_slug()
     test_plain()
-    for t in (test_context, test_inbox, test_gitsync):
+    for t in (test_context, test_context_via, test_inbox, test_inbox_via, test_gitsync):
         with tempfile.TemporaryDirectory() as d:
             t(Path(d))
     print("OK: all tests passed")

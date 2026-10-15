@@ -38,12 +38,13 @@ def slug(text: str, n: int = SLUG_LEN) -> str:
     return head[:n].strip("_") or "memo"
 
 
-def save_context(vault: Path, channel_id: str, ts: str, text: str) -> Path:
-    """その日のファイルに時刻付きで追記する。なければ作る。"""
+def save_context(vault: Path, channel_id: str, ts: str, text: str, via: str | None = None) -> Path:
+    """その日のファイルに時刻付きで追記する。なければ作る。via があれば、見出しに (via) を付ける。"""
     t = _jst(ts)
     day = t.strftime("%Y-%m-%d")
     path = vault / CONTEXT_DIR / f"{day}_context.md"
-    entry = f"\n## {t:%H:%M:%S}\n\n{text.strip()}\n"
+    label = f" ({via})" if via else ""
+    entry = f"\n## {t:%H:%M:%S}{label}\n\n{text.strip()}\n"
     with _lock:
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.exists():
@@ -69,13 +70,14 @@ def save_context(vault: Path, channel_id: str, ts: str, text: str) -> Path:
     return path
 
 
-def save_inbox(vault: Path, channel_id: str, ts: str, text: str) -> Path:
-    """1投稿1ファイルで 00_Inbox/ に保存する。"""
+def save_inbox(vault: Path, channel_id: str, ts: str, text: str, via: str | None = None) -> Path:
+    """1投稿1ファイルで 00_Inbox/ に保存する。via があれば、frontmatter に記録する。"""
     t = _jst(ts)
     day = t.strftime("%Y-%m-%d")
     lines = text.strip().splitlines()
     title = re.sub(r'["\\]', "", lines[0] if lines else "")[:60]
     base = f"{day}_{t:%H%M}_{slug(text)}"
+    via_line = f"via: {via}\n" if via else ""
     with _lock:
         folder = vault / INBOX_DIR
         folder.mkdir(parents=True, exist_ok=True)
@@ -90,6 +92,7 @@ def save_inbox(vault: Path, channel_id: str, ts: str, text: str) -> Path:
             f'title: "{title}"\n'
             "type: fleeting\n"
             "source: slack\n"
+            f"{via_line}"
             f"origin_id: slack:{channel_id}:{ts}\n"
             f"created: {day}\n"
             f"updated: {day}\n"

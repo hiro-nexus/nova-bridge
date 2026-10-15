@@ -19,6 +19,17 @@ def load_dotenv(path: Path) -> None:
         os.environ.setdefault(key.strip(), value.strip())
 
 
+def parse_pairs(value: str) -> dict[str, str]:
+    """'ボットID:チャンネルID,ボットID:チャンネルID' を {ボットID: チャンネルID} にする。不完全な組は無視する。"""
+    pairs: dict[str, str] = {}
+    for item in value.split(","):
+        bot, _, channel = item.strip().partition(":")
+        bot, channel = bot.strip(), channel.strip()
+        if bot and channel:
+            pairs[bot] = channel
+    return pairs
+
+
 @dataclass
 class Config:
     slack_bot_token: str
@@ -31,6 +42,7 @@ class Config:
     state_dir: Path
     context_channel_id: str | None
     inbox_channel_id: str | None
+    shortcut_bots: dict[str, str]  # Webhook のボットID -> 投稿先のチャンネルID
 
 
 def load_config() -> Config:
@@ -49,6 +61,7 @@ def load_config() -> Config:
         state_dir=BASE_DIR / "state",
         context_channel_id=os.environ.get("CONTEXT_CHANNEL_ID") or None,
         inbox_channel_id=os.environ.get("INBOX_CHANNEL_ID") or None,
+        shortcut_bots=parse_pairs(os.environ.get("SHORTCUT_BOTS", "")),
     )
 
 

@@ -54,3 +54,18 @@ sudo journalctl -u nova-bridge -f       # ログ（hiro は systemd-journal グ�
 - 最後の保存から5分後に、保存したファイルだけをまとめて `git pull --rebase --autostash` → `add` → `commit` → `push`（`gitsync.py`）
 - 有効にするには `.env` に `CONTEXT_CHANNEL_ID` / `INBOX_CHANNEL_ID` を書いて再起動（空なら無効）
 - テスト: `.venv/bin/python tests/test_capture.py`
+
+## Siri ショートカット（Webhook）の投稿（Phase 2-D）
+- 専用の Slack アプリ「Nova Shortcut」の Webhook だけが対象。`.env` の `SHORTCUT_BOT_ID` と一致するボットの投稿（`subtype=bot_message`）だけを受け付ける。空なら無効
+- `#context` / `#inbox` に届いたら、キーボード投稿と同じ保存（`#context` は見出しに `(音声)`、`#inbox` は frontmatter に `via: 音声`）
+- `#nova-hub` に届いたら、すぐには実行しない。👀 を付けて「実行しますか？」とスレッドに返信し、**Hiro 本人が元の投稿にチェック（✅）を付けたときだけ**実行する。24時間で失効。ブリッジを再起動すると確認待ちは消える
+- 流量制限: 10分に20件まで。超えた分は保存せず、`#nova-hub` に1度だけ知らせる
+- Webhook の URL が漏れたら: Slack アプリの設定で URL を無効にし、新しい URL を発行してショートカットを更新する
+- Nova アプリの設定に、`reactions:read` の権限と `reaction_added` のイベント購読が必要
+- テスト: `.venv/bin/python tests/test_shortcut.py`
+
+### 訂正（Phase 2-F）: Webhook のボットIDは、Webhook ごとに違う
+- 実機で確認したところ、Webhook の投稿のボットIDは、Webhook（＝チャンネル）ごとに異なった（`#inbox` と `#context` で別のID）
+- `.env` の `SHORTCUT_BOT_ID`（単一）は廃止し、`SHORTCUT_BOTS=ボットID:チャンネルID,ボットID:チャンネルID` に置き換えた
+- 許可する条件は「ボットIDが一致し、かつ、そのボットに結びつけたチャンネルに投稿されたこと」
+- 新しい Webhook を足したとき: テスト投稿を1件送ると、ログ（`state/bridge.log`）に `ignored bot/subtype message: channel=… bot_id=…` が出る。そのボットIDとチャンネルIDを `SHORTCUT_BOTS` に足して再起動する
