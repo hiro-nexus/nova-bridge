@@ -29,6 +29,8 @@ class Config:
     agent_workdir: str
     agent_model: str | None
     state_dir: Path
+    context_channel_id: str | None
+    inbox_channel_id: str | None
 
 
 def load_config() -> Config:
@@ -45,6 +47,8 @@ def load_config() -> Config:
         agent_workdir=os.environ["AGENT_WORKDIR"],
         agent_model=os.environ.get("AGENT_MODEL") or "sonnet",
         state_dir=BASE_DIR / "state",
+        context_channel_id=os.environ.get("CONTEXT_CHANNEL_ID") or None,
+        inbox_channel_id=os.environ.get("INBOX_CHANNEL_ID") or None,
     )
 
 

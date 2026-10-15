@@ -6,12 +6,15 @@ import logging
 import queue
 import re
 import threading
+from pathlib import Path
 
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 from agents.base import AgentAuthError
+from capture import plain, save_context, save_inbox
 from config import build_agent, load_config
+from gitsync import GitSync
 from session_store import SessionStore
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -26,6 +29,14 @@ agent = build_agent(cfg)
 sessions = SessionStore(cfg.state_dir / "sessions.json", key=cfg.nova_channel_id)
 app = App(token=cfg.slack_bot_token)
 jobs: "queue.Queue[dict]" = queue.Queue()
+
+# #context / #inbox は Claude を呼ばず、コードが直接 vault に保存する
+vault = Path(cfg.agent_workdir)
+capture_by_channel = {}
+if cfg.context_channel_id:
+    capture_by_channel[cfg.context_channel_id] = save_context
+if cfg.inbox_channel_id:
+    capture_by_channel[cfg.inbox_channel_id] = save_inbox
 
 
 # ---- Slack 出力 ----
@@ -56,14 +67,34 @@ def post(text: str) -> None:
         app.client.chat_postMessage(channel=cfg.nova_channel_id, text=part)
 
 
-def react(ts: str, add: str | None = None, remove: str | None = None) -> None:
+def react(ts: str, add: str | None = None, remove: str | None = None, channel: str | None = None) -> None:
+    channel = channel or cfg.nova_channel_id
     try:
         if remove:
-            app.client.reactions_remove(channel=cfg.nova_channel_id, timestamp=ts, name=remove)
+            app.client.reactions_remove(channel=channel, timestamp=ts, name=remove)
         if add:
-            app.client.reactions_add(channel=cfg.nova_channel_id, timestamp=ts, name=add)
+            app.client.reactions_add(channel=channel, timestamp=ts, name=add)
     except Exception as e:  # リアクションの失敗で本処理を止めない
         log.warning("reaction failed: %s", e)
+
+
+gitsync = GitSync(vault, notify=post)
+
+
+def capture(saver, channel: str, ts: str, text: str) -> None:
+    """#context / #inbox の投稿を保存する（Claude は呼ばない）。"""
+    try:
+        path = saver(vault, channel, ts, plain(text))
+        gitsync.mark(path)
+        log.info("captured %d chars -> %s", len(text), path.name)
+        react(ts, add="white_check_mark", channel=channel)
+    except Exception as e:
+        log.exception("capture failed")
+        react(ts, add="x", channel=channel)
+        try:
+            app.client.chat_postMessage(channel=channel, text=f"保存に失敗しました：{type(e).__name__}")
+        except Exception:
+            log.exception("could not report capture failure")
 
 
 # ---- 処理（1件ずつ直列） ----
@@ -128,13 +159,20 @@ def on_message(event, logger):
     if event.get("subtype") or event.get("bot_id"):
         return
     channel, user = event.get("channel"), event.get("user")
-    if channel != cfg.nova_channel_id:
+    saver = capture_by_channel.get(channel)
+    if channel != cfg.nova_channel_id and not saver:
         log.info("ignored message in other channel %s", channel)
         return
     if user != cfg.allowed_user_id:
         log.info("ignored message from other user")
         return
     text = event.get("text") or ""
+    if saver:
+        # スレッド返信と空の投稿は保存しない
+        if (event.get("thread_ts") and event["thread_ts"] != event["ts"]) or not text.strip():
+            return
+        capture(saver, channel, event["ts"], text)
+        return
     log.info("accepted message: %d chars (queue=%d)", len(text), jobs.qsize())
     react(event["ts"], add="eyes")
     jobs.put({"ts": event["ts"], "text": text})
@@ -147,6 +185,8 @@ def on_mention(event):
 
 if __name__ == "__main__":
     threading.Thread(target=worker, daemon=True).start()
+    gitsync.recover()
+    threading.Thread(target=gitsync.run, daemon=True).start()
     me = app.client.auth_test()
     log.info("connected as %s; agent=%s workdir=%s model=%s",
              me.get("user"), cfg.agent, cfg.agent_workdir, cfg.agent_model)

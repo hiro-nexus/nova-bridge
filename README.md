@@ -45,3 +45,12 @@ sudo journalctl -u nova-bridge -f       # ログ（hiro は systemd-journal グ�
 ## 注意
 - `.env` は chmod 600。トークンをログやチャットに出さない
 - `ANTHROPIC_API_KEY` はアダプター内で必ず環境から外す（API従量課金の防止）
+
+## #context / #inbox の保存（Phase 2-B）
+- `#context` に書く → `70_AI_Lab/75_Context/10_self/slack/YYYY-MM-DD_context.md` に時刻つきで追記
+- `#inbox` に書く → `00_Inbox/YYYY-MM-DD_HHMM_<先頭15文字>.md` に1件1ファイルで保存
+- Claude は呼ばない。コードが直接書く（`capture.py`）。保存できたら ✅、失敗したら ❌ とチャンネルに理由
+- Hiro 本人の通常投稿だけが対象（ボット・Webhook・他ユーザー・編集・削除・スレッド返信・空の投稿は無視）
+- 最後の保存から5分後に、保存したファイルだけをまとめて `git pull --rebase --autostash` → `add` → `commit` → `push`（`gitsync.py`）
+- 有効にするには `.env` に `CONTEXT_CHANNEL_ID` / `INBOX_CHANNEL_ID` を書いて再起動（空なら無効）
+- テスト: `.venv/bin/python tests/test_capture.py`
