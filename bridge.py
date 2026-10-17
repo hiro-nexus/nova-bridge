@@ -16,6 +16,7 @@ from agents.base import AgentAuthError
 from capture import plain, save_context, save_inbox
 from config import build_agent, load_config
 from gitsync import GitSync
+from redact import redact
 from session_store import SessionStore
 from shortcut import PendingConfirmations, RateLimiter
 
@@ -79,9 +80,15 @@ def chunks(text: str, size: int = CHUNK_SIZE):
         yield text
 
 
-def post(text: str) -> None:
-    for part in chunks(to_slack(text) or "（空の返答でした）"):
-        app.client.chat_postMessage(channel=cfg.nova_channel_id, text=part)
+def post(text: str, thread_ts: str | None = None, broadcast: bool = False) -> None:
+    """#nova-hub に投稿する。thread_ts があればそのスレッドへ。broadcast なら、スレッドの返信を本流にも出す（最初の1通だけ）。"""
+    for i, part in enumerate(chunks(to_slack(text) or "（空の返答でした）")):
+        extra = {}
+        if thread_ts:
+            extra["thread_ts"] = thread_ts
+            if broadcast and i == 0:
+                extra["reply_broadcast"] = True
+        app.client.chat_postMessage(channel=cfg.nova_channel_id, text=part, **extra)
 
 
 def react(ts: str, add: str | None = None, remove: str | None = None, channel: str | None = None) -> None:
@@ -98,8 +105,25 @@ def react(ts: str, add: str | None = None, remove: str | None = None, channel: s
 gitsync = GitSync(vault, notify=post)
 
 
+def scrub(text: str, channel: str) -> str:
+    """秘密情報らしき文字列を伏せ字にする。見つけたら、そのチャンネルに警告を出す（文字列そのものは書かない・記録しない）。"""
+    clean, found = redact(text)
+    if found:
+        kinds = "、".join(sorted(set(found)))
+        log.warning("secret-like strings redacted: channel=%s kinds=%s count=%d", channel, kinds, len(found))
+        try:
+            app.client.chat_postMessage(
+                channel=channel,
+                text=f"秘密情報らしき文字列（{kinds}）を検出したため、伏せ字にして処理します。元の投稿は Slack に残っています。投稿を削除し、該当の URL や鍵は無効にして、作り直してください。",
+            )
+        except Exception:
+            log.exception("could not post secret warning")
+    return clean
+
+
 def capture(saver, channel: str, ts: str, text: str, via: str | None = None) -> None:
-    """#context / #inbox の投稿を保存する（Claude は呼ばない）。"""
+    """#context / #inbox の投稿を保存する（Claude は呼ばない）。保存の前に、秘密情報を伏せ字にする。"""
+    text = scrub(text, channel)
     try:
         path = saver(vault, channel, ts, plain(text), via=via)
         gitsync.mark(path)
@@ -118,10 +142,15 @@ def capture(saver, channel: str, ts: str, text: str, via: str | None = None) -> 
 
 def handle(job: dict) -> None:
     ts, text = job["ts"], job["text"]
+    # 確認ずみの音声の指示は、元の投稿のスレッドに返事をする。最初の1通は本流にも出して、見つけやすくする
+    thread_ts = job.get("thread_ts")
+
+    def say(message: str) -> None:
+        post(message, thread_ts=thread_ts, broadcast=bool(thread_ts))
 
     if text.strip() in RESET_WORDS:
         sessions.reset()
-        post("新しい会話を始めます。")
+        say("新しい会話を始めます。")
         react(ts, add="white_check_mark", remove="eyes")
         return
 
@@ -129,19 +158,19 @@ def handle(job: dict) -> None:
 
     def progress():
         while not done.wait(PROGRESS_INTERVAL):
-            post("処理中です。もう少しお待ちください。")
+            post("処理中です。もう少しお待ちください。", thread_ts=thread_ts)
 
     threading.Thread(target=progress, daemon=True).start()
     try:
         result = agent.run(text, sessions.get())
     except AgentAuthError:
         log.error("agent auth error")
-        post("認証が切れました。SSHで再ログインが必要です。")
+        say("認証が切れました。SSHで再ログインが必要です。")
         react(ts, add="x", remove="eyes")
         return
     except Exception as e:
         log.exception("agent failed")
-        post(f"エラーが発生しました：{type(e).__name__}: {str(e)[:300]}")
+        say(f"エラーが発生しました：{type(e).__name__}: {str(e)[:300]}")
         react(ts, add="x", remove="eyes")
         return
     finally:
@@ -153,7 +182,11 @@ def handle(job: dict) -> None:
     body = result.text
     if result.denials:
         body += "\n\n---\n権限がないため、次の操作は実行しませんでした：\n" + "\n".join(f"- {d}" for d in result.denials)
-    post(body)
+    if thread_ts:
+        # どの指示への返事かが分かるように、冒頭に指示を1行で添える
+        one_line = " ".join(text.split())
+        body = f"音声の指示：「{one_line[:80]}{'…' if len(one_line) > 80 else ''}」への返事です。\n\n{body}"
+    say(body)
     react(ts, add="x" if result.is_error else "white_check_mark", remove="eyes")
 
 
@@ -189,7 +222,7 @@ def on_shortcut_message(event) -> None:
         capture(saver, channel, ts, text, via="音声")
         return
     # #nova-hub：すぐには実行せず、Hiroさん本人の確認（チェックのリアクション）を待つ
-    pending_confirm.add(ts, plain(text))
+    pending_confirm.add(ts, plain(scrub(text, cfg.nova_channel_id)))
     log.info("voice instruction waiting for confirmation: %d chars", len(text))
     react(ts, add="eyes")
     app.client.chat_postMessage(
@@ -229,6 +262,7 @@ def on_message(event, logger):
             return
         capture(saver, channel, event["ts"], text)
         return
+    text = scrub(text, cfg.nova_channel_id)  # AI に渡す前に、秘密情報を伏せ字にする
     log.info("accepted message: %d chars (queue=%d)", len(text), jobs.qsize())
     react(event["ts"], add="eyes")
     jobs.put({"ts": event["ts"], "text": text})
@@ -248,7 +282,7 @@ def on_reaction(event):
         post("確認の期限（24時間）が切れた音声の指示です。もう一度送ってください。")
     elif status == "ok":
         log.info("voice instruction confirmed: %d chars", len(text))
-        jobs.put({"ts": item["ts"], "text": text})
+        jobs.put({"ts": item["ts"], "text": text, "thread_ts": item["ts"]})
 
 
 @app.event("app_mention")
