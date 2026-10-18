@@ -15,6 +15,7 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 from agents.base import AgentAuthError
 from capture import plain, save_context, save_inbox
 from config import build_agent, load_config
+from connector import strip_connector_suffix
 from gitsync import GitSync
 from redact import redact
 from session_store import SessionStore
@@ -106,7 +107,8 @@ gitsync = GitSync(vault, notify=post)
 
 
 def scrub(text: str, channel: str) -> str:
-    """秘密情報らしき文字列を伏せ字にする。見つけたら、そのチャンネルに警告を出す（文字列そのものは書かない・記録しない）。"""
+    """Claude アプリ経由の定型文を除き、秘密情報らしき文字列を伏せ字にする。見つけたら、そのチャンネルに警告を出す（文字列そのものは書かない・記録しない）。"""
+    text = strip_connector_suffix(text)
     clean, found = redact(text)
     if found:
         kinds = "、".join(sorted(set(found)))
@@ -122,8 +124,11 @@ def scrub(text: str, channel: str) -> str:
 
 
 def capture(saver, channel: str, ts: str, text: str, via: str | None = None) -> None:
-    """#context / #inbox の投稿を保存する（Claude は呼ばない）。保存の前に、秘密情報を伏せ字にする。"""
+    """#context / #inbox の投稿を保存する（Claude は呼ばない）。保存の前に、定型文を除き、秘密情報を伏せ字にする。"""
     text = scrub(text, channel)
+    if not text.strip():  # 定型文だけの投稿は保存しない
+        log.info("skipped empty capture after cleanup: channel=%s", channel)
+        return
     try:
         path = saver(vault, channel, ts, plain(text), via=via)
         gitsync.mark(path)
@@ -262,7 +267,10 @@ def on_message(event, logger):
             return
         capture(saver, channel, event["ts"], text)
         return
-    text = scrub(text, cfg.nova_channel_id)  # AI に渡す前に、秘密情報を伏せ字にする
+    text = scrub(text, cfg.nova_channel_id)  # AI に渡す前に、定型文を除き、秘密情報を伏せ字にする
+    if not text.strip():  # 定型文だけの投稿は実行しない
+        log.info("ignored empty message after cleanup")
+        return
     log.info("accepted message: %d chars (queue=%d)", len(text), jobs.qsize())
     react(event["ts"], add="eyes")
     jobs.put({"ts": event["ts"], "text": text})
