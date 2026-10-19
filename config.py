@@ -42,6 +42,7 @@ class Config:
     state_dir: Path
     context_channel_id: str | None
     inbox_channel_id: str | None
+    journal_channel_id: str | None  # #journal（空なら、ジャーナルの返信の受け取りは無効）
     shortcut_bots: dict[str, str]  # Webhook のボットID -> 投稿先のチャンネルID
 
 
@@ -61,6 +62,7 @@ def load_config() -> Config:
         state_dir=BASE_DIR / "state",
         context_channel_id=os.environ.get("CONTEXT_CHANNEL_ID") or None,
         inbox_channel_id=os.environ.get("INBOX_CHANNEL_ID") or None,
+        journal_channel_id=os.environ.get("JOURNAL_CHANNEL_ID") or None,
         shortcut_bots=parse_pairs(os.environ.get("SHORTCUT_BOTS", "")),
     )
 

@@ -13,7 +13,7 @@ POLL_SECONDS = 30
 NOTIFY_AFTER = 3      # 連続失敗がこの回数に達したら知らせる
 OURS = re.compile(
     r"^(00_Inbox/\d{4}-\d{2}-\d{2}_\d{4}_.+\.md"
-    r"|70_AI_Lab/75_Context/10_self/slack/\d{4}-\d{2}-\d{2}_context\.md)$"
+    r"|70_AI_Lab/75_Context/10_self/slack/\d{4}-\d{2}-\d{2}_(context|journal_summary)\.md)$"
 )
 
 

@@ -17,6 +17,7 @@ from capture import plain, save_context, save_inbox
 from config import build_agent, load_config
 from connector import strip_connector_suffix
 from gitsync import GitSync
+from journal import DoneStore, build_prompt, day_of, is_morning_post, save_summary
 from redact import redact
 from session_store import SessionStore
 from shortcut import PendingConfirmations, RateLimiter
@@ -56,6 +57,10 @@ if cfg.inbox_channel_id:
 # Siri ショートカット（Webhook）の投稿。許可するのは、SHORTCUT_BOTS に書いた「ボットID:チャンネルID」の組と一致するものだけ
 shortcut_limiter = RateLimiter()      # 10分に20件まで
 pending_confirm = PendingConfirmations()  # #nova-hub への音声の指示は、本人の確認を待つ
+
+# #journal：朝の投稿へのスレッド返信（Claude アプリの回答のまとめ）。処理済みの返信を覚えて、二重処理を防ぐ
+journal_done = DoneStore(cfg.state_dir / "journal_done.json")
+_bot_user_id: str | None = None
 
 
 # ---- Slack 出力 ----
@@ -145,7 +150,34 @@ def capture(saver, channel: str, ts: str, text: str, via: str | None = None) -> 
 
 # ---- 処理（1件ずつ直列） ----
 
+def handle_journal(job: dict) -> None:
+    """#journal のまとめの清書。#nova-hub の会話とは別の、新しい会話で実行する。結果は #nova-hub に短く知らせる。"""
+    channel, ts = cfg.journal_channel_id, job["ts"]
+    try:
+        result = agent.run(job["prompt"], None)
+    except AgentAuthError:
+        log.error("agent auth error (journal)")
+        post("ジャーナルの清書ができませんでした。認証が切れました。SSHで再ログインが必要です。原文は保存済みです。")
+        react(ts, add="x", channel=channel)
+        return
+    except Exception as e:
+        log.exception("journal agent failed")
+        post(f"ジャーナルの清書に失敗しました：{type(e).__name__}。原文は保存済みです。")
+        react(ts, add="x", channel=channel)
+        return
+    body = f"ジャーナルの清書：{result.text}"
+    if result.denials:
+        body += "\n\n権限がないため、次の操作は実行しませんでした：\n" + "\n".join(f"- {d}" for d in result.denials)
+    post(body)
+    if result.is_error:
+        react(ts, add="x", channel=channel)
+    log.info("journal job done: error=%s", result.is_error)
+
+
 def handle(job: dict) -> None:
+    if job.get("journal"):
+        handle_journal(job)
+        return
     ts, text = job["ts"], job["text"]
     # 確認ずみの音声の指示は、元の投稿のスレッドに返事をする。最初の1通は本流にも出して、見つけやすくする
     thread_ts = job.get("thread_ts")
@@ -208,6 +240,56 @@ def worker() -> None:
 
 # ---- Slack 入力 ----
 
+def bot_user_id() -> str:
+    global _bot_user_id
+    if _bot_user_id is None:
+        _bot_user_id = app.client.auth_test()["user_id"]
+    return _bot_user_id
+
+
+def on_journal_message(event) -> None:
+    """#journal：Nova の朝の投稿へのスレッド返信（Hiroさん本人）だけを、回答のまとめとして受け取る。"""
+    channel, ts = event.get("channel"), event.get("ts")
+    if event.get("user") != cfg.allowed_user_id:
+        log.info("ignored journal message from other user")
+        return
+    thread_ts = event.get("thread_ts")
+    if not thread_ts or thread_ts == ts:
+        log.info("ignored top-level post in journal channel")
+        return
+    text = event.get("text") or ""
+    if not text.strip() or journal_done.seen(ts):
+        return
+    try:
+        replies = app.client.conversations_replies(channel=channel, ts=thread_ts, limit=1, inclusive=True)
+        parent = (replies.get("messages") or [None])[0]
+        is_post = is_morning_post(parent, bot_user_id())
+    except Exception as e:
+        log.exception("journal parent check failed")
+        post(f"#journal の返信の確認に失敗しました：{type(e).__name__}。Nova のアプリに #journal の履歴を読む権限があるか、確認が必要です。")
+        return
+    if not is_post:
+        log.info("ignored journal reply: parent is not a Nova post")
+        return
+    journal_done.add(ts)  # 先に記録する（再配信や再起動で二重に処理しない）
+    text = scrub(text, channel)
+    if not text.strip():  # 定型文だけの返信は保存しない
+        log.info("skipped empty journal reply after cleanup")
+        return
+    try:
+        path = save_summary(vault, channel, thread_ts, ts, plain(text))
+    except Exception as e:
+        log.exception("journal summary save failed")
+        react(ts, add="x", channel=channel)
+        post(f"ジャーナルのまとめの保存に失敗しました：{type(e).__name__}")
+        return
+    gitsync.mark(path)
+    react(ts, add="white_check_mark", channel=channel)
+    log.info("journal summary saved: %d chars -> %s", len(text), path.name)
+    jobs.put({"journal": True, "ts": ts,
+              "prompt": build_prompt(day_of(thread_ts), str(path.relative_to(vault)), plain(text))})
+
+
 def on_shortcut_message(event) -> None:
     """専用アプリ「Nova Shortcut」の Webhook 投稿。保存用チャンネルには保存、#nova-hub は確認待ち。"""
     channel, ts = event.get("channel"), event.get("ts")
@@ -253,6 +335,9 @@ def on_message(event, logger):
                  event.get("channel"), event.get("subtype"), event.get("bot_id"))
         return
     channel, user = event.get("channel"), event.get("user")
+    if cfg.journal_channel_id and channel == cfg.journal_channel_id:
+        on_journal_message(event)
+        return
     saver = capture_by_channel.get(channel)
     if channel != cfg.nova_channel_id and not saver:
         log.info("ignored message in other channel %s", channel)
@@ -303,6 +388,8 @@ if __name__ == "__main__":
     gitsync.recover()
     threading.Thread(target=gitsync.run, daemon=True).start()
     me = app.client.auth_test()
-    log.info("connected as %s; agent=%s workdir=%s model=%s shortcut_bots=%d",
-             me.get("user"), cfg.agent, cfg.agent_workdir, cfg.agent_model, len(cfg.shortcut_bots))
+    _bot_user_id = me.get("user_id")
+    log.info("connected as %s; agent=%s workdir=%s model=%s shortcut_bots=%d journal=%s",
+             me.get("user"), cfg.agent, cfg.agent_workdir, cfg.agent_model, len(cfg.shortcut_bots),
+             "on" if cfg.journal_channel_id else "off")
     SocketModeHandler(app, cfg.slack_app_token).start()
